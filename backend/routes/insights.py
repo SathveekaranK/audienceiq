@@ -8,10 +8,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from auth import get_current_user, require_creator_access, require_post_access
 from database import get_db
 from models import (
     User, Creator, UserCreator, Post, Commenter, Comment,
@@ -22,14 +23,8 @@ from models import (
 router = APIRouter(prefix="/api/v1", tags=["AudienceIQ Insights"])
 
 
-def _creator_or_404(creator_id: int, db: Session) -> Creator:
-    creator = db.query(Creator).filter(Creator.creator_id == creator_id).first()
-    if not creator:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Creator not found",
-        )
-    return creator
+def _creator_or_404(creator_id: int, db: Session, current_user: User) -> Creator:
+    return require_creator_access(db, current_user, creator_id)
 
 
 def _creator_comments(creator_id: int, db: Session, post_id: Optional[int] = None):
@@ -53,9 +48,14 @@ def _scope(query, post_id: Optional[int] = None):
 # ===== CREATOR WORKSPACE =====
 
 @router.get("/creators")
-async def list_creators(db: Session = Depends(get_db)):
+async def list_creators(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """List every creator tracked in the workspace, with headline stats."""
-    creators = db.query(Creator).order_by(Creator.creator_id).all()
+    creators = db.query(Creator).join(UserCreator).filter(
+        UserCreator.user_id == current_user.user_id
+    ).order_by(Creator.creator_id).all()
 
     payload = []
     for creator in creators:
@@ -90,9 +90,13 @@ async def list_creators(db: Session = Depends(get_db)):
 
 
 @router.get("/creators/{creator_id}")
-async def get_creator(creator_id: int, db: Session = Depends(get_db)):
+async def get_creator(
+    creator_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Get a single creator's profile and headline stats."""
-    creator = _creator_or_404(creator_id, db)
+    creator = _creator_or_404(creator_id, db, current_user)
 
     posts = db.query(Post).filter(Post.creator_id == creator_id).all()
     total_views = sum(p.view_count or 0 for p in posts)
@@ -126,9 +130,24 @@ async def get_creator(creator_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/creators/{creator_id}")
-async def delete_creator(creator_id: int, db: Session = Depends(get_db)):
+async def delete_creator(
+    creator_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Remove a creator and all of their analysis data."""
-    creator = _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
+
+    link_count = db.query(UserCreator).filter(
+        UserCreator.creator_id == creator_id
+    ).count()
+    if link_count > 1:
+        db.query(UserCreator).filter(
+            UserCreator.creator_id == creator_id,
+            UserCreator.user_id == current_user.user_id,
+        ).delete(synchronize_session=False)
+        db.commit()
+        return {"message": "Creator removed from workspace", "creator_id": creator_id}
 
     post_ids = [p.post_id for p in db.query(Post).filter(
         Post.creator_id == creator_id
@@ -182,9 +201,13 @@ async def delete_creator(creator_id: int, db: Session = Depends(get_db)):
 # ===== DASHBOARD OVERVIEW =====
 
 @router.get("/dashboard/summary/{creator_id}")
-async def dashboard_summary(creator_id: int, db: Session = Depends(get_db)):
+async def dashboard_summary(
+    creator_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Everything the overview page needs, in a single request."""
-    creator = _creator_or_404(creator_id, db)
+    creator = _creator_or_404(creator_id, db, current_user)
 
     posts = db.query(Post).filter(Post.creator_id == creator_id).all()
     comments = _creator_comments(creator_id, db)
@@ -302,9 +325,13 @@ async def dashboard_summary(creator_id: int, db: Session = Depends(get_db)):
 # ===== VIDEO & COMMENT LISTS =====
 
 @router.get("/creators/{creator_id}/videos")
-async def list_videos(creator_id: int, db: Session = Depends(get_db)):
+async def list_videos(
+    creator_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """List a creator's videos with per-video comment and sentiment stats."""
-    creator = _creator_or_404(creator_id, db)
+    creator = _creator_or_404(creator_id, db, current_user)
     posts = db.query(Post).filter(
         Post.creator_id == creator_id
     ).order_by(Post.published_at.desc()).all()
@@ -343,17 +370,20 @@ async def list_comments(
     creator_id: int,
     sentiment: Optional[str] = None,
     search: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Browse a creator's comments with sentiment filter and search."""
-    creator = _creator_or_404(creator_id, db)
+    creator = _creator_or_404(creator_id, db, current_user)
 
     query = db.query(Comment).join(Post).filter(Post.creator_id == creator_id)
 
     if search:
-        query = query.filter(Comment.comment_text.ilike(f"%{search}%"))
+        # Escape LIKE wildcards so a search for "%" cannot pull every row.
+        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = query.filter(Comment.comment_text.ilike(f"%{escaped}%", escape="\\"))
 
     comments = query.order_by(Comment.collected_at.desc()).all()
 
@@ -398,9 +428,10 @@ async def list_topics(
     creator_id: int,
     post_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Stored topics for a creator, ordered by how often they come up."""
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     rows = db.query(
         Topic.topic_id,
@@ -468,9 +499,10 @@ async def list_segments(
     creator_id: int,
     post_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Stored audience segments with representative comments."""
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     segments = db.query(AudienceSegment).filter(
         AudienceSegment.creator_id == creator_id
@@ -518,11 +550,12 @@ async def list_pain_points(
     creator_id: int,
     post_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Stored pain points with the comments that triggered them."""
     from services import pain_points as pain_point_service
 
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     comments = _creator_comments(creator_id, db, post_id)
 
@@ -552,9 +585,10 @@ async def list_content_requests(
     creator_id: int,
     post_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Stored content demand signals, grouped by category."""
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     query = db.query(
         ContentRequest.request_category,
@@ -601,11 +635,12 @@ async def list_content_requests(
 @router.get("/analysis/sentiment/timeseries/{creator_id}")
 async def sentiment_timeseries(
     creator_id: int,
-    days: int = 30,
+    days: int = Query(30, ge=1, le=3650),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Sentiment trend over time, bucketed by day."""
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     since = datetime.utcnow() - timedelta(days=days)
 
@@ -654,12 +689,13 @@ async def list_emotions(
     creator_id: int,
     post_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Emotion breakdown: influenced / triggered / hate / love / curious.
 
     Pass ``post_id`` to scope the analysis to a single video.
     """
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     query = db.query(Comment).join(Post).filter(Post.creator_id == creator_id)
     if post_id:
@@ -736,21 +772,29 @@ async def list_emotions(
 
 
 @router.get("/videos/{post_id}/emotions")
-async def video_emotions(post_id: int, db: Session = Depends(get_db)):
+async def video_emotions(
+    post_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Emotion breakdown for one video."""
-    post = db.query(Post).filter(Post.post_id == post_id).first()
-    if not post:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video not found",
-        )
-    return await list_emotions(post.creator_id, post_id=post_id, db=db)
+    post = require_post_access(db, current_user, post_id)
+    return await list_emotions(
+        post.creator_id,
+        post_id=post_id,
+        db=db,
+        current_user=current_user,
+    )
 
 
 @router.get("/analysis/overview/{creator_id}")
-async def analysis_overview(creator_id: int, db: Session = Depends(get_db)):
+async def analysis_overview(
+    creator_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Counts of what analysis data exists, so the UI can prompt the user."""
-    _creator_or_404(creator_id, db)
+    _creator_or_404(creator_id, db, current_user)
 
     comments = db.query(func.count(Comment.comment_id)).join(Post).filter(
         Post.creator_id == creator_id

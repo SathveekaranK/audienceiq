@@ -9,6 +9,24 @@ const BASE_URL =
   (import.meta as { env?: Record<string, string> }).env?.VITE_API_URL ??
   'http://127.0.0.1:8000'
 
+const AUTH_TOKEN_KEY = 'aiq_access_token'
+
+function getAuthToken(): string | null {
+  return window.localStorage.getItem(AUTH_TOKEN_KEY)
+}
+
+export function setAuthToken(token: string): void {
+  window.localStorage.setItem(AUTH_TOKEN_KEY, token)
+}
+
+export function clearAuthToken(): void {
+  window.localStorage.removeItem(AUTH_TOKEN_KEY)
+}
+
+export function hasAuthToken(): boolean {
+  return Boolean(getAuthToken())
+}
+
 export class ApiError extends Error {
   status: number
   detail: string
@@ -42,11 +60,14 @@ async function request<T>(
   let response: Response
 
   try {
+    const headers: Record<string, string> = {}
+    if (options.body) headers['Content-Type'] = 'application/json'
+    const token = getAuthToken()
+    if (token) headers.Authorization = `Bearer ${token}`
+
     response = await fetch(buildUrl(path, options.query), {
       method,
-      headers: options.body
-        ? { 'Content-Type': 'application/json' }
-        : undefined,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
       body: options.body ? JSON.stringify(options.body) : undefined,
     })
   } catch {
@@ -67,6 +88,10 @@ async function request<T>(
   }
 
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/api/v1/auth/')) {
+      clearAuthToken()
+      window.dispatchEvent(new Event('audienceiq:auth-expired'))
+    }
     const detail =
       typeof payload === 'object' && payload !== null && 'detail' in payload
         ? String((payload as { detail: unknown }).detail)
@@ -97,6 +122,12 @@ export interface CreatorStats {
   reports: number
   views?: number
   likes?: number
+}
+
+export interface AuthResponse {
+  user_id: number
+  access_token: string
+  token_type: 'bearer'
 }
 
 export interface Creator {
@@ -397,17 +428,32 @@ export const api_ = {
     api.get<{ creator_id: number; reports: Report[] }>(`/api/v1/reports/${creatorId}`),
 
   // Auth
-  register: (username: string, email: string, password: string) =>
-    api.post<{ user_id: number }>('/api/v1/auth/register', undefined, {
+  // Credentials go in the JSON body - never in the query string, where they
+  // would end up in the URL, browser history and server access logs.
+  register: async (username: string, email: string, password: string) => {
+    const result = await api.post<AuthResponse>('/api/v1/auth/register', {
       username,
       email,
       password,
-    }),
-  login: (username: string, password: string) =>
-    api.post<{ user_id: number }>('/api/v1/auth/login', undefined, {
+    })
+    setAuthToken(result.access_token)
+    return result
+  },
+  login: async (username: string, password: string) => {
+    const result = await api.post<AuthResponse>('/api/v1/auth/login', {
       username,
       password,
-    }),
+    })
+    setAuthToken(result.access_token)
+    return result
+  },
+  logout: async () => {
+    try {
+      return await api.post<{ message: string }>('/api/v1/auth/logout')
+    } finally {
+      clearAuthToken()
+    }
+  },
 
   // YouTube video analysis
   resolveVideo: (url: string) =>

@@ -20,7 +20,7 @@ audienceiq/
 │   ├── main.py              # FastAPI app entry point
 │   ├── database.py          # DB connection + SQLite fallback
 │   ├── models.py            # SQLAlchemy models
-│   ├── seed_demo.py         # Demo data seeder
+│   ├── seed_demo.py         # One-video VJ Siddhu seed loader
 │   ├── requirements.txt
 │   ├── routes/
 │   │   ├── api.py           # Action endpoints (analyse, collect, generate)
@@ -73,7 +73,8 @@ That single command:
 1. Checks that Python and Node.js are installed
 2. Installs backend dependencies if any are missing
 3. Installs frontend dependencies if `node_modules` is missing
-4. Seeds a demo channel with 3 videos and 28 comments (skipped if already present)
+4. Seeds one verified VJ Siddhu Vlogs upload and up to 60 real comments
+   (the first run prints a one-time password for the `demo` account)
 5. Starts the backend on `http://127.0.0.1:8000`
 6. Starts the frontend on `http://localhost:3001`
 7. Opens your browser at `http://localhost:3001`
@@ -96,8 +97,9 @@ Press `Ctrl+C` to stop both.
 
 ## Using the app
 
-1. Open `http://localhost:3001` - the demo channel is already loaded.
-2. Press **Run full analysis** on the Overview page (or use the buttons on
+1. Open `http://localhost:3001` and sign in as `demo` with the one-time
+   password printed by the seeder. You can also register a separate account.
+2. The seeded VJ Siddhu channel is ready; press **Run full analysis** on the Overview page (or use the buttons on
    each page) to compute sentiment, topics and segments.
 3. Explore the eleven pages:
 
@@ -117,7 +119,7 @@ Press `Ctrl+C` to stop both.
 
 4. Use the **channel picker** in the sidebar to switch channels, or
    **Add channel** to track a new one.
-5. **Sign in** (bottom of the sidebar) to create an account.
+5. Use **Sign out** at the bottom of the sidebar to invalidate the current session.
 
 ---
 
@@ -171,10 +173,17 @@ The analysis is deliberately explainable and runs offline:
 
 ### Seeding / resetting demo data
 
+The default seed contains exactly one video: VJ Siddhu Vlogs' November 11,
+2026 upload, `5j4GMySx_Ac` (`Egypt Series | Ep 01`). Metadata and comments are
+refreshed from YouTube when the network is available.
+
 ```bash
 cd backend
-python seed_demo.py            # add demo data if missing
-python seed_demo.py --reset    # wipe and rebuild it
+python seed_demo.py                         # seed the verified default video
+python seed_demo.py --comments 100          # choose the comment limit (max 500)
+python seed_demo.py --video <youtube-url>   # seed a different single video
+python seed_demo.py --reset                 # wipe and rebuild the seeded channel
+python seed_demo.py --offline               # use bundled fallback metadata/comments
 ```
 
 ---
@@ -237,6 +246,17 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/audienceiq
 
 Tables are created automatically on startup - there is no migration step.
 
+### Security configuration
+
+- Every `/api/v1` workspace endpoint requires an `Authorization: Bearer <token>`
+  header. Registration and login return an opaque session token; logout revokes it.
+- Session tokens expire after 7 days by default. Set `AUTH_SESSION_DAYS` to a
+  value from 1 to 90 to change this.
+- Set `ALLOWED_ORIGINS` to a comma-separated list of exact frontend origins in
+  deployed environments, and set `ENV=production` to disable interactive API docs.
+- Set `SEED_DEMO_PASSWORD` before seeding if you do not want a random one-time
+  demo password printed to the console.
+
 ---
 
 ## API Reference
@@ -248,6 +268,7 @@ All endpoints are prefixed with `/api/v1`.
 |---|---|---|
 | POST | `/auth/register` | Create an account |
 | POST | `/auth/login` | Sign in |
+| POST | `/auth/logout` | Revoke the current bearer session |
 
 ### Workspace
 | Method | Path | Purpose |

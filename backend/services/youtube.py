@@ -71,6 +71,36 @@ _USER_AGENT = (
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+_LIKE_COUNT_RE = re.compile(r"like this video along with ([\d,\.]+) other people")
+_LENGTH_RE = re.compile(r'"lengthSeconds":"(\d+)"')
+_PUBLISHED_RE = re.compile(r'"(?:publishDate|uploadDate)":"([^"]+)"')
+
+
+def _parse_date_text(value: str) -> str:
+    """Turn a human date such as "Premiered on 11 Nov 2026" into an ISO date.
+
+    YouTube localises this string, so both "11 Nov 2026" and "Nov 11, 2026"
+    are accepted.
+    """
+    if not value:
+        return ""
+
+    from datetime import datetime
+
+    patterns = (
+        (r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})", "%d %b %Y"),
+        (r"([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})", "%b %d, %Y"),
+    )
+    for pattern, fmt in patterns:
+        match = re.search(pattern, value)
+        if not match:
+            continue
+        try:
+            return datetime.strptime(" ".join(match.groups()), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
 
 class YouTubeError(RuntimeError):
     """Raised when YouTube cannot be reached or returns an error."""
@@ -140,6 +170,51 @@ def _walk(node: Any):
             yield from _walk(value)
 
 
+def _extract_json_object(html: str, var_name: str) -> Optional[Dict[str, Any]]:
+    """Extract a JavaScript object literal assigned to ``var_name``.
+
+    YouTube embeds its page data as ``var ytInitialData = {...};``. We locate
+    the assignment and then balance the braces while ignoring braces that
+    appear inside strings.
+    """
+    index = html.find(f"var {var_name} = ")
+    if index < 0:
+        index = html.find(f"{var_name} = ")
+        if index < 0:
+            return None
+
+    start = html.find("{", index)
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for position in range(start, len(html)):
+        char = html[position]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start:position + 1])
+                except ValueError:
+                    return None
+    return None
+
+
 def _innertube(endpoint: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
     """POST to a YouTube InnerTube endpoint and return the parsed JSON."""
     url = f"https://www.youtube.com/youtubei/v1/{endpoint}"
@@ -203,7 +278,14 @@ class YouTubeClient:
             except YouTubeError:
                 pass  # fall through to the keyless path
 
-        return self._resolve_via_innertube(video_id)
+        try:
+            return self._resolve_via_innertube(video_id)
+        except YouTubeError:
+            pass  # fall through to the watch page fallback
+
+        # The player endpoint sometimes answers with "Sign in to confirm
+        # you're not a bot". The watch page still renders, so use that.
+        return self._resolve_via_watch_page(video_id)
 
     def fetch_comments(self, url_or_id: str, max_comments: int = 200) -> List[Dict[str, Any]]:
         """Fetch the top-level comments for a video.
@@ -281,6 +363,99 @@ class YouTubeClient:
             "thumbnail_url": thumbnail,
             "comment_count": None,
             "source": "innertube",
+        }
+
+    def _resolve_via_watch_page(self, video_id: str) -> Dict[str, Any]:
+        """Fallback metadata source: scrape the public watch page.
+
+        YouTube sometimes answers the ``player`` endpoint with
+        ``LOGIN_REQUIRED`` ("Sign in to confirm you're not a bot"). The watch
+        page itself still renders, so we read the values we need out of
+        ``ytInitialData``.
+        """
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                html = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise YouTubeError(f"YouTube returned HTTP {exc.code}.") from exc
+        except urllib.error.URLError as exc:
+            raise YouTubeError(f"Could not reach YouTube: {exc.reason}") from exc
+
+        data = _extract_json_object(html, "ytInitialData")
+        if not data:
+            raise YouTubeError("YouTube did not return any details for that video.")
+
+        title = ""
+        views_text = ""
+        date_text = ""
+        description = ""
+        channel = ""
+        channel_id = ""
+
+        for node in _walk(data):
+            if "videoPrimaryInfoRenderer" in node:
+                primary = node["videoPrimaryInfoRenderer"]
+                if not title:
+                    title = _text_of(primary.get("title"))
+                if not views_text:
+                    view_count = primary.get("viewCount") or {}
+                    views_text = _text_of(
+                        (view_count.get("videoViewCountRenderer") or {}).get("viewCount")
+                    )
+                if not date_text:
+                    date_text = _text_of(primary.get("dateText"))
+            if "videoSecondaryInfoRenderer" in node and not description:
+                for sub in _walk(node["videoSecondaryInfoRenderer"]):
+                    if "attributedDescription" in sub:
+                        description = sub["attributedDescription"].get("content") or ""
+                        break
+            if "videoOwnerRenderer" in node and not channel:
+                owner = node["videoOwnerRenderer"]
+                channel = _text_of(owner.get("title"))
+                browse = (owner.get("navigationEndpoint") or {}).get("browseEndpoint") or {}
+                channel_id = browse.get("browseId") or ""
+
+        if not title:
+            raise YouTubeError("YouTube did not return any details for that video.")
+
+        like_count = None
+        like_match = _LIKE_COUNT_RE.search(html)
+        if like_match:
+            like_count = _to_int(like_match.group(1))
+
+        duration = None
+        length_match = _LENGTH_RE.search(html)
+        if length_match:
+            duration = _to_int(length_match.group(1))
+
+        published_at = _parse_date_text(date_text)
+        if not published_at:
+            published_match = _PUBLISHED_RE.search(html)
+            if published_match:
+                published_at = published_match.group(1)
+
+        return {
+            "video_id": video_id,
+            "title": title,
+            "channel": channel,
+            "channel_id": channel_id,
+            "author_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else "",
+            "description": description,
+            "published_at": published_at,
+            "view_count": _to_int(re.sub(r"[^\d]", "", views_text)) if views_text else None,
+            "like_count": like_count,
+            "duration_seconds": duration,
+            "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            "comment_count": None,
+            "source": "watch_page",
         }
 
     def _resolve_via_data_api(self, video_id: str) -> Dict[str, Any]:

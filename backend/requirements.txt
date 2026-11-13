@@ -3,10 +3,8 @@ nltk==3.10.4
 numpy==2.4.6
 pandas==3.0.5
 psycopg2-binary==2.9.11
-python-dotenv==1.2.1
-sentence-transformers==5.2.2
 SQLAlchemy==2.0.25
-transformers==5.0.0
+transformers==5.22.2
 uvicorn==0.54.0
 bcrypt==5.0.0
 scikit-learn==1.8.0

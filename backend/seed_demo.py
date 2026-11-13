@@ -1,11 +1,23 @@
-"""Seed the database with a demo channel, videos and comments.
+"""Seed the database with a real YouTube channel, video and comments.
 
 Run it from the backend folder:
 
     python seed_demo.py
 
-It is safe to run multiple times - existing rows are reused rather than
-duplicated. Use ``--reset`` to wipe the demo data first.
+The default seed is the latest **VJ Siddhu Vlogs** video. Metadata and
+comments are pulled live from YouTube (no API key required - the public
+InnerTube endpoints are used), so the dashboard shows genuine audience
+signals instead of made up numbers.
+
+Options::
+
+    python seed_demo.py --video <url|id>   # seed a different video
+    python seed_demo.py --comments 100     # how many comments to fetch
+    python seed_demo.py --reset            # wipe the previous seed first
+    python seed_demo.py --offline          # skip the network, use the fallback
+
+The script is idempotent - re-running it updates the same rows instead of
+creating duplicates.
 """
 
 import argparse
@@ -16,153 +28,214 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent
 sys.path.insert(0, str(BACKEND))
 
+# YouTube titles and comments can contain any script - never let the Windows
+# console encoding blow up while printing them.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # pragma: no cover - older Python versions
+    pass
+
 from database import SessionLocal, init_db  # noqa: E402
-from models import User, Creator, UserCreator, Post, Comment  # noqa: E402
+from models import User, Creator, UserCreator, Post, Comment, Commenter  # noqa: E402
+
+# Latest VJ Siddhu Vlogs video ("Egypt Series | Ep 01"). Overridable with
+# --video, so the seed can always be pointed at the newest upload.
+DEFAULT_VIDEO_ID = "5j4GMySx_Ac"
+DEFAULT_CHANNEL_NAME = "Vj Siddhu Vlogs"
 
 DEMO_USER = {
     "username": "demo",
     "email": "demo@audienceiq.local",
-    "password_hash": "demo-not-a-real-hash",
 }
 
-DEMO_CHANNEL = {
-    "platform_id": "yt_techtalksdaily",
-    "creator_name": "TechTalks Daily",
-    "platform_type": "youtube",
-    "description": "Beginner friendly AI and programming tutorials.",
+# Used only when YouTube cannot be reached (offline / --offline).
+FALLBACK_VIDEO = {
+    "video_id": DEFAULT_VIDEO_ID,
+    "title": "இப்பவே பேசிட்டா? கல்யாணத்துக்கு அப்புறம்... 😂😉😆| Egypt Series | Ep 01 | Vj Siddhu Vlogs",
+    "channel": DEFAULT_CHANNEL_NAME,
+    "channel_id": "UCJcCB-QYPIBcbKcBQOTwhiA",
+    "description": "Seed fallback - YouTube was unreachable when this was seeded.",
+    "published_at": "2026-11-11T01:30:11-08:00",
+    "view_count": 2377992,
+    "like_count": 0,
+    "duration_seconds": 1204,
+    "thumbnail_url": f"https://i.ytimg.com/vi/{DEFAULT_VIDEO_ID}/maxresdefault.jpg",
 }
 
-DEMO_VIDEOS = [
-    {
-        "platform_post_id": "yt_techtalksdaily_v1",
-        "title": "Getting Started with AI",
-        "description": "A beginner friendly introduction to machine learning.",
-        "views": 48200,
-        "likes": 3120,
-        "days_ago": 45,
-    },
-    {
-        "platform_post_id": "yt_techtalksdaily_v2",
-        "title": "Your First Python Project",
-        "description": "Build a working script from scratch.",
-        "views": 31500,
-        "likes": 1890,
-        "days_ago": 28,
-    },
-    {
-        "platform_post_id": "yt_techtalksdaily_v3",
-        "title": "Prompt Engineering in 2024",
-        "description": "Practical techniques for better AI prompts.",
-        "views": 62900,
-        "likes": 4870,
-        "days_ago": 12,
-    },
-]
-
-# (video key, text, likes, days_ago)
-DEMO_COMMENTS = [
-    ("v1", "This is great! I finally understand how it works, thanks for the clear explanation.", 42, 44),
-    ("v1", "Very helpful tutorial, the pacing is perfect and the examples are easy to follow.", 38, 44),
-    ("v1", "Excellent content! I've been waiting for a beginner friendly guide like this.", 31, 43),
-    ("v1", "Love how practical this is. I built my first project following along.", 27, 42),
-    ("v1", "Great video, but some parts go too fast and I had to rewind a few times.", 19, 41),
-    ("v1", "Really good overview, though it would help to see more hands-on demonstrations.", 16, 40),
-    ("v1", "Thanks, this answered a lot of my questions about the topic.", 12, 39),
-    ("v1", "The explanation is clear but it assumes you already know some programming.", 14, 38),
-    ("v1", "Super helpful, I shared this with my whole team and we all learned a lot.", 9, 37),
-    ("v1", "Good content overall. Please make a follow up on the advanced techniques.", 7, 36),
-    ("v1", "Fantastic, this is exactly the kind of tutorial I was looking for.", 11, 35),
-    ("v1", "Solid video, but could you include the downloadable resources in the description?", 8, 34),
-    ("v1", "Could you make a follow-up video?", 5, 33),
-    ("v1", "I wish there were more practical demonstrations.", 6, 32),
-    ("v1", "Awesome content, subscribed!", 4, 31),
-    ("v2", "Finally a tutorial that does not skip the boring parts. Thank you!", 22, 27),
-    ("v2", "The explanation was too fast, hard to follow.", 13, 26),
-    ("v2", "Can you explain how decorators work in more detail?", 10, 25),
-    ("v2", "How do I deploy this to the cloud once I finish it?", 9, 24),
-    ("v2", "Please make a series on testing, this would help a lot.", 8, 23),
-    ("v2", "Really helpful, I understand the basics now.", 7, 22),
-    ("v3", "Prompt engineering tips like this are gold. Saving this video.", 51, 11),
-    ("v3", "I have been using these prompts and my results are way better now.", 33, 10),
-    ("v3", "Would love a follow up on prompt chaining for longer workflows.", 24, 9),
-    ("v3", "The examples are great but the theory section was too long.", 18, 8),
-    ("v3", "Can you show how to use this with the API?", 15, 7),
-    ("v3", "This cleared up so much confusion for me, thanks!", 12, 6),
-    ("v3", "Please make a video about RAG systems next.", 9, 5),
+FALLBACK_COMMENTS = [
+    ("Amazing episode as always! 🔥", 120, 0),
+    ("Bro the acting is next level 😂😂", 95, 1),
+    ("Waiting for the next episode immediately", 80, 1),
+    ("This series is the best thing on YouTube right now", 74, 2),
+    ("Placed my bets on the next part already 😬", 61, 3),
+    ("Sir please make more episodes like this one", 55, 4),
+    ("The comedy timing in this one is perfect 🤣", 49, 5),
+    ("Not me watching this 5 times in a row", 41, 6),
+    ("Vlogs episodes are always on point", 37, 7),
+    ("Give this man an award already 🏆", 33, 8),
+    ("The best channel on YouTube, hands down", 28, 9),
+    ("New episode dropped and I am not disappointed", 24, 10),
 ]
 
 
-def seed(reset: bool = False) -> None:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_published_at(value) -> datetime:
+    """Best effort conversion of a YouTube date string into a datetime."""
+    if not value:
+        return datetime.utcnow()
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(text[:len(fmt) + 6].strip(), fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return datetime.utcnow()
+
+
+def fetch_from_youtube(video_ref: str, max_comments: int):
+    """Return (metadata, comments) for the given video."""
+    from services.youtube import YouTubeClient
+
+    client = YouTubeClient()
+    metadata = client.resolve(video_ref)
+    comments = []
+    try:
+        comments = client.fetch_comments(video_ref, max_comments=max_comments)
+    except Exception as exc:  # noqa: BLE001 - comments are optional
+        print(f"[seed] Could not fetch comments: {exc}")
+    return metadata, comments
+
+
+# ---------------------------------------------------------------------------
+# Seed
+# ---------------------------------------------------------------------------
+
+def seed(reset: bool = False, video_ref: str = DEFAULT_VIDEO_ID,
+         max_comments: int = 60, offline: bool = False) -> None:
+    max_comments = max(1, min(max_comments, 500))
     init_db()
     db = SessionLocal()
 
     try:
-        existing_demo = db.query(Creator).filter(
-            Creator.platform_id == DEMO_CHANNEL["platform_id"]
+        # -- fetch the real data -------------------------------------------
+        if offline:
+            print("[seed] Offline mode - using the bundled fallback data.")
+            metadata = dict(FALLBACK_VIDEO)
+            raw_comments = [
+                {
+                    "comment_id": f"fallback_{i}",
+                    "text": text,
+                    "author": f"viewer{i}",
+                    "likes": likes,
+                    "published_at": "",
+                }
+                for i, (text, likes, days_ago) in enumerate(FALLBACK_COMMENTS)
+            ]
+        else:
+            print(f"[seed] Fetching {video_ref} from YouTube ...")
+            metadata, raw_comments = fetch_from_youtube(video_ref, max_comments)
+
+        video_id = metadata.get("video_id") or DEFAULT_VIDEO_ID
+        channel_name = metadata.get("channel") or DEFAULT_CHANNEL_NAME
+        channel_id = metadata.get("channel_id") or ""
+        creator_platform_id = f"yt_channel_{channel_id}" if channel_id else "yt_vj_siddhu_vlogs"
+        print(f"[seed] Video : {metadata.get('title')}")
+        print(f"[seed] Channel: {channel_name} ({creator_platform_id})")
+        print(f"[seed] Comments fetched: {len(raw_comments)}")
+
+        # -- clean up a previous seed --------------------------------------
+        existing_creator = db.query(Creator).filter(
+            Creator.platform_id == creator_platform_id
         ).first()
 
-        # Nothing to do when the demo channel is already seeded.
-        if existing_demo and not reset:
-            comment_count = db.query(Comment).join(Post).filter(
-                Post.creator_id == existing_demo.creator_id
-            ).count()
-            if comment_count > 0:
-                print(
-                    f"[seed] Demo data already present "
-                    f"({comment_count} comments). Use --reset to rebuild it."
-                )
-                return
-
-        if reset:
-            print("[seed] Removing existing demo data...")
-            if existing_demo:
-                post_ids = [
-                    p.post_id
-                    for p in db.query(Post).filter(
-                        Post.creator_id == existing_demo.creator_id
-                    ).all()
-                ]
+        if existing_creator and reset:
+            print("[seed] Removing existing seeded data...")
+            post_ids = [
+                p.post_id
+                for p in db.query(Post).filter(
+                    Post.creator_id == existing_creator.creator_id
+                ).all()
+            ]
+            if post_ids:
                 comment_ids = [
                     c.comment_id
                     for c in db.query(Comment).filter(
                         Comment.post_id.in_(post_ids)
                     ).all()
-                ] if post_ids else []
+                ]
                 if comment_ids:
                     db.query(Comment).filter(
                         Comment.comment_id.in_(comment_ids)
                     ).delete(synchronize_session=False)
-                if post_ids:
-                    db.query(Post).filter(Post.post_id.in_(post_ids)).delete(
-                        synchronize_session=False
-                    )
-                db.query(UserCreator).filter(
-                    UserCreator.creator_id == existing_demo.creator_id
-                ).delete(synchronize_session=False)
-                db.query(Creator).filter(
-                    Creator.creator_id == existing_demo.creator_id
-                ).delete(synchronize_session=False)
-                db.commit()
+                db.query(Post).filter(Post.post_id.in_(post_ids)).delete(
+                    synchronize_session=False
+                )
+            db.query(UserCreator).filter(
+                UserCreator.creator_id == existing_creator.creator_id
+            ).delete(synchronize_session=False)
+            db.query(Creator).filter(
+                Creator.creator_id == existing_creator.creator_id
+            ).delete(synchronize_session=False)
+            db.commit()
+            existing_creator = None
 
-        # User
-        user = db.query(User).filter(
-            User.username == DEMO_USER["username"]
-        ).first()
-        if not user:
-            user = User(**DEMO_USER)
-            db.add(user)
+        # -- user ----------------------------------------------------------
+        user = db.query(User).filter(User.username == DEMO_USER["username"]).first()
+        needs_password = not user or not (user.password_hash or "").startswith(
+            ("$2a$", "$2b$", "$2y$")
+        )
+        if needs_password:
+            import os
+            import secrets
+
+            from bcrypt import hashpw, gensalt
+
+            # Never ship a usable credential in the source tree. Use
+            # SEED_DEMO_PASSWORD when set, otherwise generate a random one and
+            # print it exactly once.
+            password = os.getenv("SEED_DEMO_PASSWORD") or secrets.token_urlsafe(12)
+            password_hash = hashpw(
+                password.encode("utf-8"), gensalt()
+            ).decode("utf-8")
+            if user:
+                user.password_hash = password_hash
+            else:
+                user = User(
+                    username=DEMO_USER["username"],
+                    email=DEMO_USER["email"],
+                    password_hash=password_hash,
+                )
+                db.add(user)
             db.commit()
             db.refresh(user)
+            print(f"[seed] Demo user '{user.username}' credential created.")
+            print(f"[seed] One-time password: {password}")
 
-        # Creator
-        creator = db.query(Creator).filter(
-            Creator.platform_id == DEMO_CHANNEL["platform_id"]
-        ).first()
+        # -- creator -------------------------------------------------------
+        creator = existing_creator
         if not creator:
-            creator = Creator(**DEMO_CHANNEL)
+            creator = Creator(
+                platform_id=creator_platform_id,
+                creator_name=channel_name,
+                platform_type="youtube",
+                description=(metadata.get("description") or "")[:1000],
+                profile_image=metadata.get("thumbnail_url") or None,
+            )
             db.add(creator)
             db.commit()
             db.refresh(creator)
+        else:
+            creator.creator_name = channel_name
+            creator.description = (metadata.get("description") or "")[:1000]
+            creator.profile_image = metadata.get("thumbnail_url") or creator.profile_image
+            db.commit()
 
         if not db.query(UserCreator).filter(
             UserCreator.user_id == user.user_id,
@@ -171,67 +244,87 @@ def seed(reset: bool = False) -> None:
             db.add(UserCreator(user_id=user.user_id, creator_id=creator.creator_id))
             db.commit()
 
-        # Videos
-        posts = {}
-        for spec in DEMO_VIDEOS:
-            post = db.query(Post).filter(
-                Post.platform_post_id == spec["platform_post_id"]
-            ).first()
-            if not post:
-                post = Post(
-                    creator_id=creator.creator_id,
-                    platform_post_id=spec["platform_post_id"],
-                    title=spec["title"],
-                    description=spec["description"],
-                    published_at=datetime.utcnow()
-                    - timedelta(days=spec["days_ago"]),
-                    view_count=spec["views"],
-                    like_count=spec["likes"],
-                    comment_count=0,
-                )
-                db.add(post)
-                db.commit()
-                db.refresh(post)
-            posts[spec["platform_post_id"].rsplit("_", 1)[-1]] = post
+        # -- video ---------------------------------------------------------
+        post = db.query(Post).filter(
+            Post.platform_post_id == video_id
+        ).first()
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        published_at = parse_published_at(metadata.get("published_at"))
+        if not post:
+            post = Post(creator_id=creator.creator_id, platform_post_id=video_id)
+            db.add(post)
+        post.creator_id = creator.creator_id
+        post.title = (metadata.get("title") or "")[:500]
+        post.description = metadata.get("description") or ""
+        post.published_at = published_at
+        post.view_count = int(metadata.get("view_count") or 0)
+        post.like_count = int(metadata.get("like_count") or 0)
+        post.duration_seconds = metadata.get("duration_seconds") or None
+        post.thumbnail_url = metadata.get("thumbnail_url") or None
+        post.watch_url = watch_url
+        post.source_url = watch_url
+        db.commit()
+        db.refresh(post)
 
-        # Comments
-        existing_ids = {c.platform_comment_id for c in db.query(Comment).all()}
+        # -- comments ------------------------------------------------------
+        existing_ids = {
+            c.platform_comment_id
+            for c in db.query(Comment).filter(Comment.post_id == post.post_id).all()
+        }
         added = 0
-        for index, (video_key, text, likes, days_ago) in enumerate(DEMO_COMMENTS):
-            post = posts.get(video_key)
-            if post is None:
+        for raw in raw_comments:
+            text = (raw.get("text") or "").strip()
+            if not text:
                 continue
-            # Use a stable id so re-running the seeder never duplicates rows
-            # and never collides with the ids used by /comments/collect.
-            platform_id = f"{post.platform_post_id}_c{index}"
+            platform_id = f"ytc_{raw.get('comment_id') or added}"
             if platform_id in existing_ids:
                 continue
+
+            commenter_id = None
+            author = (raw.get("author") or "").strip()
+            if author:
+                author_key = f"yt_author_{author}"
+                commenter = db.query(Commenter).filter(
+                    Commenter.platform_commenter_id == author_key
+                ).first()
+                if not commenter:
+                    commenter = Commenter(
+                        platform_commenter_id=author_key,
+                        display_name=author[:200],
+                    )
+                    db.add(commenter)
+                    db.commit()
+                    db.refresh(commenter)
+                commenter_id = commenter.commenter_id
+
             db.add(
                 Comment(
                     platform_comment_id=platform_id,
                     post_id=post.post_id,
+                    commenter_id=commenter_id,
                     comment_text=text,
-                    like_count=likes,
-                    published_at=datetime.utcnow() - timedelta(days=days_ago),
-                    collected_at=datetime.utcnow() - timedelta(days=days_ago),
+                    like_count=int(raw.get("likes") or 0),
+                    published_at=parse_published_at(raw.get("published_at")),
+                    collected_at=datetime.utcnow(),
+                    author_name=author[:150] or None,
+                    is_pinned=bool(raw.get("is_pinned")),
                 )
             )
+            existing_ids.add(platform_id)
             added += 1
 
-        # Keep the stored comment_count in sync with reality
-        for post in posts.values():
-            post.comment_count = db.query(Comment).filter(
-                Comment.post_id == post.post_id
-            ).count()
-
+        post.comment_count = db.query(Comment).filter(
+            Comment.post_id == post.post_id
+        ).count()
         db.commit()
 
         print()
-        print("  Demo data ready")
+        print("  Seed data ready")
         print("  -----------------")
         print(f"  Creator : {creator.creator_name} (id {creator.creator_id})")
-        print(f"  Videos  : {len(posts)}")
-        print(f"  Comments: {db.query(Comment).filter(Comment.post_id.in_([p.post_id for p in posts.values()])).count()}")
+        print(f"  Video   : {post.title}")
+        print(f"  Views   : {post.view_count:,}")
+        print(f"  Comments: {post.comment_count} (+{added} new)")
         print()
         print("  Next: open the dashboard and press 'Run full analysis'.")
         print()
@@ -240,11 +333,32 @@ def seed(reset: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Seed AudienceIQ with demo data")
+    parser = argparse.ArgumentParser(description="Seed AudienceIQ with a real YouTube video")
+    parser.add_argument(
+        "--video",
+        default=DEFAULT_VIDEO_ID,
+        help="YouTube URL or video id to seed (default: the latest VJ Siddhu Vlogs video)",
+    )
+    parser.add_argument(
+        "--comments",
+        type=int,
+        default=60,
+        help="How many comments to fetch (default: 60)",
+    )
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Remove existing demo data before seeding",
+        help="Remove existing seeded data before seeding",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Do not call YouTube - use the bundled fallback data instead",
     )
     args = parser.parse_args()
-    seed(reset=args.reset)
+    seed(
+        reset=args.reset,
+        video_ref=args.video,
+        max_comments=args.comments,
+        offline=args.offline,
+    )

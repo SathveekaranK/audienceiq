@@ -32,10 +32,31 @@ class User(Base):
     
     # Relationships
     user_creators = relationship("UserCreator", back_populates="user")
+    auth_sessions = relationship(
+        "AuthSession", back_populates="user", cascade="all, delete-orphan"
+    )
     
     __table_args__ = (
         Index('ix_users_username', 'username'),
         Index('ix_users_email', 'email'),
+    )
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    session_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    token_hash = Column(String(64), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+    user = relationship("User", back_populates="auth_sessions")
+
+    __table_args__ = (
+        Index('ix_auth_sessions_user_id', 'user_id'),
+        Index('ix_auth_sessions_token_hash', 'token_hash'),
+        Index('ix_auth_sessions_expires_at', 'expires_at'),
     )
 
 

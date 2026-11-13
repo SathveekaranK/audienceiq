@@ -1,22 +1,97 @@
 """Main API Router for AudienceIQ"""
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict, Any
 import asyncio
 import json
+import logging
 from datetime import datetime
 
+from pydantic import BaseModel, Field
+
+from auth import (
+    create_session,
+    get_current_session,
+    get_current_user,
+    require_comment_access,
+    require_creator_access,
+    require_post_access,
+)
 from database import get_db
 from sqlalchemy.orm import Session
 from services import text_preprocessor, sentiment_analyzer, topic_modeler, clustering
 from models import (
     User, Creator, UserCreator, Post, Commenter, Comment,
     SentimentResult, Topic, CommentTopic, AudienceSegment,
-    SegmentComment, ContentRequest, Report, AnalysisRun
+    SegmentComment, ContentRequest, Report, AnalysisRun, AuthSession
 )
 
+logger = logging.getLogger("audienceiq.api")
+
 router = APIRouter(prefix="/api/v1", tags=["AudienceIQ"])
+
+
+# ---------------------------------------------------------------------------
+# Request models
+#
+# Credentials must travel in the JSON body - FastAPI treats bare `str`
+# parameters as query parameters, which would put the password in the URL,
+# the browser history and the access logs.
+# ---------------------------------------------------------------------------
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: str = Field(..., min_length=3, max_length=100)
+    password: str = Field(..., min_length=8, max_length=72)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50)
+    password: str = Field(..., min_length=1, max_length=72)
+
+
+# A fixed bcrypt hash used when the username does not exist, so that failed
+# logins take the same amount of time whether or not the user is real
+# (otherwise the response time leaks which usernames are registered).
+_DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.7uOhPnI3dUX8iEyHNLm3Ph0R7QVn3Fa"
+
+
+def _check_password(password: str, hashed: str) -> bool:
+    """Compare a password against a hash, always doing the bcrypt work."""
+    from bcrypt import checkpw
+
+    try:
+        return checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:  # pragma: no cover - malformed hash in the database
+        return False
+
+
+def _rate_limit(request: Request, bucket: str, limit: int, window_seconds: int) -> bool:
+    """Very small in-process rate limiter.
+
+    Returns True when the request is allowed. This is not a replacement for
+    a shared limiter (Redis/memcached) but it stops the obvious brute-force
+    and cost-amplification loops on a single-node deployment.
+    """
+    import time
+
+    client = request.client.host if request.client else "unknown"
+    now = time.time()
+    store = getattr(request.app.state, "_rate_limits", None)
+    if store is None:
+        store = {}
+        request.app.state._rate_limits = store
+
+    key = (bucket, client)
+    hits = [t for t in store.get(key, []) if now - t < window_seconds]
+    if len(hits) >= limit:
+        store[key] = hits
+        return False
+    hits.append(now)
+    store[key] = hits
+    return True
+
 
 
 def _json_safe(value):
@@ -36,22 +111,6 @@ def _json_safe(value):
     if isinstance(value, (np.bool_,)):
         return bool(value)
     return value
-
-
-def get_current_user(db: Session = Depends(get_db)) -> User:
-    """Return the first registered user.
-
-    The API currently has no token-based auth, so the "current user" is simply
-    the earliest registered account. Replace this with real JWT/session
-    verification when authentication is wired up.
-    """
-    user = db.query(User).order_by(User.user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="No registered user. Call /api/v1/auth/register first.",
-        )
-    return user
 
 
 def _build_embeddings(texts: List[str]):
@@ -116,16 +175,20 @@ def _build_embeddings(texts: List[str]):
 
 @router.post("/auth/register")
 async def register(
-    username: str,
-    email: str,
-    password: str,
+    payload: RegisterRequest,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """User registration endpoint."""
-    # Validate the input before touching the database.
-    username = (username or "").strip()
-    email = (email or "").strip()
-    password = password or ""
+    if not _rate_limit(request, "register", limit=10, window_seconds=300):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many accounts created from this address. Try again later.",
+        )
+
+    username = payload.username.strip()
+    email = payload.email.strip()
+    password = payload.password
 
     if not username:
         raise HTTPException(
@@ -137,75 +200,104 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A valid email address is required",
         )
-    if len(password) < 6:
+    if len(password) < 8:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters",
+            detail="Password must be at least 8 characters",
+        )
+    if len(password.encode("utf-8")) > 72:
+        # bcrypt silently ignores everything past 72 bytes.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at most 72 bytes",
         )
 
     # Check if user exists
     existing_user = db.query(User).filter(
         (User.username == username) | (User.email == email)
     ).first()
-    
+
     if existing_user:
+        # Do not reveal whether the username *or* the email is the one that
+        # already exists - that would allow account enumeration.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email already registered"
+            detail="Could not create account with those details"
         )
-    
+
     # Create new user
     from bcrypt import hashpw, gensalt
     hashed_password = hashpw(password.encode('utf-8'), gensalt()).decode('utf-8')
-    
+
     new_user = User(
         username=username,
         email=email,
         password_hash=hashed_password
     )
-    
+
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    
-    return {"message": "User registered successfully", "user_id": new_user.user_id}
+
+    token = create_session(db, new_user)
+    return {
+        "message": "User registered successfully",
+        "user_id": new_user.user_id,
+        "access_token": token,
+        "token_type": "bearer",
+    }
 
 
 @router.post("/auth/login")
 async def login(
-    username: str,
-    password: str,
+    payload: LoginRequest,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """User login endpoint."""
-    from bcrypt import checkpw
-    
-    user = db.query(User).filter(User.username == username).first()
-    
-    if not user:
+    if not _rate_limit(request, "login", limit=10, window_seconds=300):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again in a few minutes.",
         )
-    
-    # checkpw raises ValueError when the stored hash is not a valid bcrypt
-    # hash (e.g. a legacy plaintext value). Treat that as a failed login
-    # rather than a server error.
-    try:
-        password_ok = checkpw(
-            password.encode('utf-8'),
-            user.password_hash.encode('utf-8'),
-        )
-    except (ValueError, TypeError):
-        password_ok = False
-    
+
+    username = payload.username.strip()
+    password = payload.password
+
+    user = db.query(User).filter(User.username == username).first()
+
+    # Always run the bcrypt comparison - against a dummy hash when the user
+    # does not exist - so the response time does not leak which usernames
+    # are registered.
+    password_ok = _check_password(
+        password,
+        user.password_hash if user else _DUMMY_HASH,
+    ) and user is not None
+
     if not password_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
-    
-    return {"message": "Login successful", "user_id": user.user_id}
+
+    token = create_session(db, user)
+    return {
+        "message": "Login successful",
+        "user_id": user.user_id,
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/auth/logout")
+async def logout(
+    auth_session: AuthSession = Depends(get_current_session),
+    db: Session = Depends(get_db),
+):
+    """Invalidate the current bearer session."""
+    db.delete(auth_session)
+    db.commit()
+    return {"message": "Logged out"}
 
 
 # ===== CREATOR DISCOVERY (FR-01) =====
@@ -213,13 +305,15 @@ async def login(
 @router.get("/creators/search")
 async def search_creators(
     query: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Search for YouTube channels."""
     # This would integrate with YouTube Data API v3
     # For now, search in local database
-    creators = db.query(Creator).filter(
-        Creator.creator_name.contains(query)
+    creators = db.query(Creator).join(UserCreator).filter(
+        UserCreator.user_id == current_user.user_id,
+        Creator.creator_name.contains(query),
     ).limit(10).all()
     
     return {
@@ -264,13 +358,13 @@ async def add_creator(
         db.refresh(creator)
         creator_id = creator.creator_id
     
-    # Link user to creator
-    user_creator = UserCreator(
-        user_id=current_user.user_id,
-        creator_id=creator_id
-    )
-    db.add(user_creator)
-    db.commit()
+    # Link user to creator without creating duplicate workspace rows.
+    if not db.query(UserCreator).filter(
+        UserCreator.user_id == current_user.user_id,
+        UserCreator.creator_id == creator_id,
+    ).first():
+        db.add(UserCreator(user_id=current_user.user_id, creator_id=creator_id))
+        db.commit()
     
     return {"message": "Creator added successfully", "creator_id": creator_id}
 
@@ -293,13 +387,7 @@ async def collect_comments(
     
     Would integrate with YouTube Data API to retrieve comments.
     """
-    # Check if post exists and belongs to user's creator
-    post = db.query(Post).filter(Post.post_id == post_id).first()
-    if not post:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Post not found"
-        )
+    post = require_post_access(db, current_user, post_id)
     
     # In a real implementation, this would call YouTube API
     # For now, simulate comment collection
@@ -371,15 +459,11 @@ async def collect_comments(
 async def analyze_sentiment(
     comment_id: int,
     use_transformer: bool = False,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze sentiment for a comment."""
-    comment = db.query(Comment).filter(Comment.comment_id == comment_id).first()
-    if not comment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Comment not found"
-        )
+    comment = require_comment_access(db, current_user, comment_id)
     
     # Initialize analyzer
     analyzer = sentiment_analyzer.SentimentAnalyzer(use_transformer=use_transformer)
@@ -429,13 +513,15 @@ async def analyze_sentiment(
 async def analyze_sentiment_bulk(
     creator_id: int,
     use_transformer: bool = False,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze sentiment for every comment belonging to a creator.
 
     This is what actually populates the sentiment distribution - the
     per-comment endpoint above is only for one comment at a time.
     """
+    require_creator_access(db, current_user, creator_id)
     comments = db.query(Comment).join(Post).filter(
         Post.creator_id == creator_id
     ).all()
@@ -502,13 +588,16 @@ async def analyze_sentiment_bulk(
 async def get_sentiment_distribution(
     creator_id: int,
     post_id: Optional[int] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Get sentiment distribution for a creator's comments.
 
     Pass ``post_id`` to scope the analysis to a single video.
     """
     from sqlalchemy import func
+
+    require_creator_access(db, current_user, creator_id)
     
     # Get sentiment results joined with comments (comments belong to a post,
     # and posts belong to a creator - so join through Post).
@@ -559,9 +648,11 @@ async def analyze_topics(
     creator_id: int,
     n_topics: int = 5,
     use_bertopic: bool = False,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Perform topic modeling on comments."""
+    require_creator_access(db, current_user, creator_id)
     # Get all comments for creator
     comments = db.query(Comment).join(Post).filter(
         Post.creator_id == creator_id
@@ -716,9 +807,11 @@ async def analyze_segmentation(
     creator_id: int,
     n_clusters: int = 5,
     use_dbscan: bool = False,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Perform audience segmentation using clustering."""
+    require_creator_access(db, current_user, creator_id)
     comments = db.query(Comment).join(Post).filter(
         Post.creator_id == creator_id
     ).all()
@@ -851,11 +944,13 @@ async def analyze_segmentation(
 @router.post("/analysis/pain-points/{creator_id}")
 async def detect_pain_points(
     creator_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Identify recurring complaints and difficulties."""
     from services import pain_points as pain_point_service
 
+    require_creator_access(db, current_user, creator_id)
     comments = db.query(Comment).join(Post).filter(
         Post.creator_id == creator_id
     ).all()
@@ -902,11 +997,13 @@ async def detect_pain_points(
 async def analyze_emotions(
     creator_id: int,
     post_id: Optional[int] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Classify comments by emotion: influenced / triggered / hate / love / curious."""
     from services import emotions as emotion_service
 
+    require_creator_access(db, current_user, creator_id)
     query = db.query(Comment).join(Post).filter(Post.creator_id == creator_id)
     if post_id:
         query = query.filter(Comment.post_id == post_id)
@@ -952,9 +1049,11 @@ async def analyze_emotions(
 @router.post("/analysis/content-requests/{creator_id}")
 async def detect_content_requests(
     creator_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Extract explicit content requests from comments."""
+    require_creator_access(db, current_user, creator_id)
     # Get all comments
     comments = db.query(Comment).join(Post).filter(
         Post.creator_id == creator_id
@@ -1054,9 +1153,11 @@ async def detect_content_requests(
 @router.get("/analysis/engagement/{creator_id}")
 async def get_engagement_analysis(
     creator_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze engagement patterns and video comment activity."""
+    require_creator_access(db, current_user, creator_id)
     # Get videos and their comment stats
     videos = db.query(Post).filter(Post.creator_id == creator_id).all()
     
@@ -1128,9 +1229,11 @@ async def get_engagement_analysis(
 @router.get("/reports/{creator_id}")
 async def get_reports(
     creator_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Get historical reports for a creator."""
+    require_creator_access(db, current_user, creator_id)
     reports = db.query(Report).filter(Report.creator_id == creator_id).all()
     
     return {
@@ -1161,6 +1264,8 @@ async def generate_report(
     """Generate a new intelligence report."""
     from sqlalchemy import func
     from datetime import datetime, timezone
+
+    require_creator_access(db, current_user, creator_id)
 
     # Accept ISO dates ("2024-01-01") or full ISO timestamps.
     def _parse_dt(value: str) -> datetime:
@@ -1264,10 +1369,13 @@ async def generate_report(
 async def get_intelligence_report(
     creator_id: int,
     report_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Get comprehensive intelligence report."""
     from sqlalchemy import func
+
+    require_creator_access(db, current_user, creator_id)
     
     # Get the report
     report = db.query(Report).filter(

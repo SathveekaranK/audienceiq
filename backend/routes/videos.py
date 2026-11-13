@@ -11,13 +11,14 @@ Endpoints
 ``GET  /api/v1/videos/workspace``    - every video that has been analysed
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from auth import get_current_user, require_post_access
 from database import get_db
 from models import (
     Creator, Post, Comment, UserCreator, User,
@@ -41,7 +42,7 @@ def _parse_published(value: str) -> Optional[datetime]:
         cleaned = value.replace("Z", "+00:00")
         parsed = datetime.fromisoformat(cleaned)
         if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(tz=None).replace(tzinfo=None)
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return parsed
     except (ValueError, TypeError):
         return None
@@ -102,11 +103,8 @@ def _get_or_create_post(db: Session, creator: Creator, meta: dict) -> Post:
     return post
 
 
-def _link_to_user(db: Session, creator: Creator) -> None:
-    """Attach the channel to the first registered user."""
-    user = db.query(User).order_by(User.user_id).first()
-    if not user:
-        return
+def _link_to_user(db: Session, creator: Creator, user: User) -> None:
+    """Attach the channel to the authenticated user's workspace."""
     if not db.query(UserCreator).filter(
         UserCreator.user_id == user.user_id,
         UserCreator.creator_id == creator.creator_id,
@@ -116,7 +114,10 @@ def _link_to_user(db: Session, creator: Creator) -> None:
 
 
 @router.post("/videos/resolve")
-async def resolve_video(url: str):
+async def resolve_video(
+    url: str,
+    current_user: User = Depends(get_current_user),
+):
     """Look up a YouTube video without saving anything.
 
     Used by the UI to show a preview card before the user commits to
@@ -138,9 +139,10 @@ async def resolve_video(url: str):
 @router.post("/videos/analyze")
 async def analyze_video(
     url: str,
-    max_comments: int = 120,
+    max_comments: int = Query(120, ge=1, le=500),
     run_analysis: bool = True,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Fetch a YouTube video's comments and analyse them.
 
@@ -175,7 +177,7 @@ async def analyze_video(
 
     meta["source_url"] = url
     creator = _get_or_create_creator(db, meta)
-    _link_to_user(db, creator)
+    _link_to_user(db, creator, current_user)
     post = _get_or_create_post(db, creator, meta)
 
     # ---- fetch the real comments -------------------------------------
@@ -366,7 +368,8 @@ def _analyse_video(db: Session, creator: Creator, post: Post, analyzer_bundle: d
         db.commit()
         results["topics"] = len(topics)
     except Exception as exc:  # noqa: BLE001
-        results["topics_error"] = str(exc)
+        logger.exception("Topic analysis failed")
+        results["topics_error"] = "Topic analysis failed - see the server log."
 
     # -- pain points ----------------------------------------------------
     rows = []
@@ -398,20 +401,16 @@ def _analyse_video(db: Session, creator: Creator, post: Post, analyzer_bundle: d
 @router.post("/videos/{post_id}/analyze")
 async def analyze_existing_video(
     post_id: int,
-    max_comments: int = 120,
+    max_comments: int = Query(120, ge=1, le=500),
     run_analysis: bool = True,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Re-fetch the comments for a video that is already tracked and re-run
     the analysis on them."""
     from services.youtube import YouTubeError, YouTubeClient
 
-    post = db.query(Post).filter(Post.post_id == post_id).first()
-    if not post:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video not found",
-        )
+    post = require_post_access(db, current_user, post_id)
 
     creator = db.query(Creator).filter(
         Creator.creator_id == post.creator_id
@@ -483,9 +482,16 @@ async def analyze_existing_video(
 
 
 @router.get("/videos/workspace")
-async def video_workspace(db: Session = Depends(get_db)):
+async def video_workspace(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Every video that has been analysed, with its headline numbers."""
-    posts = db.query(Post).order_by(Post.published_at.desc()).all()
+    posts = db.query(Post).join(
+        UserCreator, UserCreator.creator_id == Post.creator_id
+    ).filter(
+        UserCreator.user_id == current_user.user_id
+    ).order_by(Post.published_at.desc()).all()
 
     payload = []
     for post in posts:

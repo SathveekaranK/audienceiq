@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { api_, type Creator } from '@/lib/api'
+import { api_, hasAuthToken, type Creator } from '@/lib/api'
 import { useApi } from '@/lib/hooks'
 import { Sidebar, TopBar, NAV_ITEMS, type ViewKey } from '@/components/Layout'
 import { Button, Icon, Icons } from '@/components/ui'
@@ -43,13 +43,16 @@ const App: React.FC = () => {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [addCreatorOpen, setAddCreatorOpen] = useState(false)
   const [manageOpen, setManageOpen] = useState(false)
-  const [authOpen, setAuthOpen] = useState(false)
-  const [signedIn, setSignedIn] = useState(
-    () => window.localStorage.getItem('aiq_signed_in') === '1',
-  )
+  const [signedIn, setSignedIn] = useState(hasAuthToken)
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'danger' } | null>(null)
 
-  const creatorsQuery = useApi(() => api_.listCreators(), [])
+  const creatorsQuery = useApi(
+    () =>
+      signedIn
+        ? api_.listCreators()
+        : Promise.resolve({ creators: [] as Creator[], total: 0 }),
+    [signedIn],
+  )
   const creators = useMemo(() => creatorsQuery.data?.creators ?? [], [creatorsQuery.data])
 
   // Auto-select the first creator once the list loads.
@@ -84,6 +87,25 @@ const App: React.FC = () => {
     },
     [creatorsQuery, notify],
   )
+
+  useEffect(() => {
+    const handleExpiredSession = () => {
+      setSignedIn(false)
+      setCreatorId(null)
+    }
+    window.addEventListener('audienceiq:auth-expired', handleExpiredSession)
+    return () => window.removeEventListener('audienceiq:auth-expired', handleExpiredSession)
+  }, [])
+
+  if (!signedIn) {
+    return (
+      <AuthScreen
+        onAuthenticated={() => {
+          setSignedIn(true)
+        }}
+      />
+    )
+  }
 
   const meta = VIEW_META[view]
 
@@ -149,7 +171,12 @@ const App: React.FC = () => {
         onSelectCreator={setCreatorId}
         onAddCreator={() => setAddCreatorOpen(true)}
         onManageCreator={() => setManageOpen(true)}
-        onToggleAuth={() => setAuthOpen(true)}
+        onToggleAuth={() => {
+          void api_.logout().finally(() => {
+            setSignedIn(false)
+            setCreatorId(null)
+          })
+        }}
         signedIn={signedIn}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
@@ -231,23 +258,6 @@ const App: React.FC = () => {
           }}
         />
       ) : null}
-
-      <Modal
-        open={authOpen}
-        onClose={() => setAuthOpen(false)}
-        title="Account"
-        description="Sign in to sync your workspace across devices"
-      >
-        <AuthScreen
-          embedded
-          onAuthenticated={(userId) => {
-            setAuthOpen(false)
-            setSignedIn(true)
-            window.localStorage.setItem('aiq_signed_in', '1')
-            notify(`Signed in as user #${userId}`)
-          }}
-        />
-      </Modal>
 
       {toast ? (
         <Toast message={toast.message} tone={toast.tone} onClose={() => setToast(null)} />

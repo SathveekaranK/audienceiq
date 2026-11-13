@@ -52,23 +52,39 @@ def _postgres_works(url: str) -> bool:
         return False
 
 
+def _safe_url(url: str) -> str:
+    """Hide the password before a connection string is written to the log."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(url)
+        if not parsed.password:
+            return url
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunparse(parsed._replace(netloc=f"{netloc}:***"))
+    except Exception:  # pragma: no cover - never let logging break startup
+        return "<redacted>"
+
+
 def _create_engine():
     env_url = os.getenv("DATABASE_URL")
 
     if env_url:
         if env_url.startswith("sqlite"):
-            print(f"[database] Using DATABASE_URL from environment: {env_url}")
+            print(f"[database] Using DATABASE_URL from environment: {_safe_url(env_url)}")
             return create_engine(
                 env_url,
                 connect_args={"check_same_thread": False},
                 echo=ECHO_SQL,
             )
         if _postgres_works(env_url):
-            print("[database] Using PostgreSQL from DATABASE_URL.")
+            print(f"[database] Using PostgreSQL from DATABASE_URL: {_safe_url(env_url)}")
             return create_engine(env_url, pool_pre_ping=True, echo=ECHO_SQL)
 
     if _postgres_works(POSTGRES_URL):
-        print(f"[database] Using PostgreSQL at {POSTGRES_URL}")
+        print(f"[database] Using PostgreSQL at {_safe_url(POSTGRES_URL)}")
         return create_engine(POSTGRES_URL, pool_pre_ping=True, echo=ECHO_SQL)
 
     print(f"[database] Falling back to SQLite at {SQLITE_URL}")

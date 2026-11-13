@@ -251,14 +251,14 @@ const Sidebar: React.FC<SidebarProps> = ({
             className="mb-2 flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors hover:bg-subtle"
           >
             <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-subtle text-2xs font-semibold text-muted">
-              <Icon path={signedIn ? Icons.check : Icons.logout} className="size-3.5" />
+              <Icon path={Icons.logout} className="size-3.5" />
             </span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-xs font-medium text-strong">
-                {signedIn ? 'Signed in' : 'Sign in'}
+                {signedIn ? 'Sign out' : 'Sign in'}
               </span>
               <span className="block truncate text-2xs text-muted">
-                {signedIn ? 'Session active' : 'Optional for local use'}
+                {signedIn ? 'End this session' : 'Authentication required'}
               </span>
             </span>
           </button>

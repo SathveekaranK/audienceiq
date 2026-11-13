@@ -146,7 +146,7 @@ const AuthScreen: React.FC<AuthScreenProps> = ({
           className="h-9 w-full rounded-md border border-line bg-surface px-3 text-sm text-strong outline-none transition-shadow placeholder:text-subtle-text focus:border-brand focus:ring-2 focus:ring-brand/15"
         />
         {mode === 'register' ? (
-          <p className="mt-1.5 text-2xs text-muted">At least 6 characters.</p>
+          <p className="mt-1.5 text-2xs text-muted">At least 8 characters.</p>
         ) : null}
       </div>
 
